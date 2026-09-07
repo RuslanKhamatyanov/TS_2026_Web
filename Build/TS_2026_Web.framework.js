@@ -5101,6 +5101,309 @@ async function createWasm() {
   		Module.WebPlayer.PlayerIsInitialized();
   	}
 
+  var wr = {
+  requests:{
+  },
+  responses:{
+  },
+  abortControllers:{
+  },
+  timer:{
+  },
+  nextRequestId:1,
+  };
+  function _JS_WebRequest_Abort(requestId)
+  	{
+  		var abortController = wr.abortControllers[requestId];
+          if (!abortController || abortController.signal.aborted) {
+              return;
+          }
+  
+          abortController.abort();
+  	}
+
+  
+  
+  function _JS_WebRequest_Create(url, method)
+  	{
+  		var _url = UTF8ToString(url);
+  		var _method = UTF8ToString(method);
+  		var abortController = new AbortController();
+  		var requestOptions = {
+  			url: _url,
+  			init: {
+  				method: _method,
+  				signal: abortController.signal,
+  				headers: {},
+  				enableStreamingDownload: true
+  			},
+  			tempBuffer: null,
+  			tempBufferSize: 0
+  		};
+  
+  		wr.abortControllers[wr.nextRequestId] = abortController;
+  		wr.requests[wr.nextRequestId] = requestOptions;
+  
+  		return wr.nextRequestId++;
+  	}
+
+  
+  function jsWebRequestGetResponseHeaderString(requestId) {
+  		var response = wr.responses[requestId];
+  		if (!response) {
+            return "";
+          }
+  
+  		// Use cached value of response header string if present
+  		if (response.headerString) {
+  			return response.headerString;
+  		}
+  
+  		// Create response header string from headers object
+  		var headers = "";
+          var entries = response.headers.entries();
+          for (var result = entries.next(); !result.done; result = entries.next()) {
+              headers += result.value[0] + ": " + result.value[1] + "\r\n"; 
+          }
+  		response.headerString = headers;
+  
+  		return headers;
+  	}
+  
+  
+  function _JS_WebRequest_GetResponseMetaData(requestId, headerBuffer, headerSize, responseUrlBuffer, responseUrlSize)
+  	{
+  		var response = wr.responses[requestId];
+  		if (!response) {
+  		  stringToUTF8("", headerBuffer, headerSize);
+  		  stringToUTF8("", responseUrlBuffer, responseUrlSize);
+            return;
+          }
+  
+  		if (headerBuffer) {
+  			var headers = jsWebRequestGetResponseHeaderString(requestId);
+  			stringToUTF8(headers, headerBuffer, headerSize);
+  		}
+  
+  		if (responseUrlBuffer) {
+  			stringToUTF8(response.url, responseUrlBuffer, responseUrlSize);
+  		}
+  	}
+
+  
+  function _JS_WebRequest_GetResponseMetaDataLengths(requestId, buffer)
+  	{
+  		buffer = (buffer >> 2);
+  		var response = wr.responses[requestId];
+  		if (!response) {
+  		  HEAPU32[buffer] = 0;
+  		  HEAPU32[buffer + 1] = 0;
+            return;
+          }
+  
+  		var headers = jsWebRequestGetResponseHeaderString(requestId);
+         
+  		// Set length of header and response url to output buffer
+  		HEAPU32[buffer] = lengthBytesUTF8(headers);
+  		HEAPU32[buffer + 1] = lengthBytesUTF8(response.url);
+  	}
+
+  function _JS_WebRequest_Release(requestId)
+  	{
+          // Clear timeout
+  		if (wr.timer[requestId]) {
+  			clearTimeout(wr.timer[requestId]);
+  		}
+  
+  		// Remove all resources for request
+  		delete wr.requests[requestId];
+  		delete wr.responses[requestId];
+  		delete wr.abortControllers[requestId];
+  		delete wr.timer[requestId];
+  	}
+
+  
+  
+  
+  function _JS_WebRequest_Send(requestId, ptr, length, arg, onresponse, onprogress)
+  	{	
+  		ptr = ptr;
+  		var requestOptions = wr.requests[requestId];
+          var abortController = wr.abortControllers[requestId];
+  
+  		function getTempBuffer(size) {
+  			// Allocate new temp buffer if none has been allocated
+  			if (!requestOptions.tempBuffer) {
+  				const initialSize = Math.max(size, 1024); // Use 1 kB as minimal temp buffer size to prevent too many reallocations
+  				requestOptions.tempBuffer = _malloc(initialSize);
+  				requestOptions.tempBufferSize = initialSize;
+  			}
+  
+  			// Increase size of temp buffer if necessary
+  			if (requestOptions.tempBufferSize < size) {
+  				_free(requestOptions.tempBuffer);
+  				requestOptions.tempBuffer =  _malloc(size);
+  				requestOptions.tempBufferSize = size;
+  			}
+  
+  			return requestOptions.tempBuffer;
+  		}
+  
+          function ClearTimeout() {
+  			if (wr.timer[requestId]) {
+  				clearTimeout(wr.timer[requestId]);
+                  delete wr.timer[requestId];
+  			}
+          }
+  
+  		function HandleSuccess(response, body) {
+              ClearTimeout();
+  
+  			if (!onresponse) {
+  				return;
+  			}
+  
+  			var kWebRequestOK = 0;
+  			// 200 is successful http request, 0 is returned by non-http requests (file:).
+  			if (requestOptions.init.enableStreamingDownload) {
+  				// Body was streamed only send final body length
+  				getWasmTableEntry(onresponse)(arg, response.status, 0, body.length, 0, kWebRequestOK);
+  			} else if (body.length != 0) {
+  				// Send whole body at once
+  				var buffer = _malloc(body.length);
+  				HEAPU8.set(body, buffer);
+  				getWasmTableEntry(onresponse)(arg, response.status, buffer, body.length, 0, kWebRequestOK);
+  				_free(buffer);
+  			} else {
+  				getWasmTableEntry(onresponse)(arg, response.status, 0, 0, 0, kWebRequestOK);
+  			}
+  
+  			// Cleanup temp buffer
+  			if (requestOptions.tempBuffer) {
+  				_free(requestOptions.tempBuffer);
+  			}
+  		}
+  
+  		function HandleError(err, code) {
+  			ClearTimeout();
+  
+              if (!onresponse) {
+  				return;
+  			}
+  
+  			var len = lengthBytesUTF8(err) + 1;
+  			var buffer = _malloc(len);
+  			stringToUTF8(err, buffer, len);
+  			getWasmTableEntry(onresponse)(arg, 500, 0, 0, buffer, code);
+              _free(buffer);
+  
+  			// Clean up temp buffer
+  			if (requestOptions.tempBuffer) {
+  				_free(requestOptions.tempBuffer);
+  			}
+  		}
+  
+  		function HandleProgress(e) {
+  			if (!onprogress) {
+  				return;
+  			}
+  
+  			var response = e.response;
+  			wr.responses[requestId] = response;
+  
+  			if (e.chunk) {
+  				// Response body streaming is enabled copy data to new buffer
+  				var buffer = getTempBuffer(e.chunk.length);
+  				HEAPU8.set(e.chunk, buffer);
+  				getWasmTableEntry(onprogress)(arg, response.status, e.loaded, e.total, buffer, e.chunk.length);
+  			} else {
+  				// no response body streaming
+  				getWasmTableEntry(onprogress)(arg, response.status, e.loaded, e.total, 0, 0);
+  			}
+  		}
+  
+  		try {
+  			if (length > 0) {
+  				var postData = HEAPU8.subarray(ptr, ptr+length);
+  				requestOptions.init.body = new Blob([postData]);
+  			}
+  
+  			// Add timeout handler if timeout is set
+  			if (requestOptions.timeout) {
+  				wr.timer[requestId] = setTimeout(function () {
+  					requestOptions.isTimedOut = true;
+  					abortController.abort();
+  				}, requestOptions.timeout);
+  			}
+  
+  			var fetchImpl = Module.fetchWithProgress;
+  			requestOptions.init.onProgress = HandleProgress;
+  			if (Module.companyName && Module.productName && Module.cachedFetch) {
+  				fetchImpl = Module.cachedFetch;
+  				requestOptions.init.companyName = Module.companyName;
+  				requestOptions.init.productName = Module.productName;
+  				requestOptions.init.productVersion = Module.productVersion;
+  				requestOptions.init.control = Module.cacheControl(requestOptions.url);
+  			}
+  
+  			fetchImpl(requestOptions.url, requestOptions.init).then(function (response) {
+  				wr.responses[requestId] = response;
+  
+                  HandleSuccess(response, response.parsedBody);
+  			}).catch(function (error) {
+  				var kWebErrorUnknown = 2;
+                  var kWebErrorAborted = 17;
+                  var kWebErrorTimeout = 14;
+  
+                  if (requestOptions.isTimedOut) {
+  					HandleError("Connection timed out.", kWebErrorTimeout);
+                  } else if (abortController.signal.aborted) {
+                      HandleError("Aborted.", kWebErrorAborted);
+                  } else {
+                      HandleError(error.message, kWebErrorUnknown);
+                  }
+  			});
+  		} catch(error) {
+  			var kWebErrorUnknown = 2;
+              HandleError(error.message, kWebErrorUnknown);
+  		}
+  	}
+
+  function _JS_WebRequest_SetRedirectLimit(request, redirectLimit)
+  	{
+  		var requestOptions = wr.requests[request];
+  		if (!requestOptions) {
+              return;
+  		}
+  
+  		// Disable redirects if redirectLimit == 0 otherwise use browser defined redirect limit
+  		requestOptions.init.redirect = redirectLimit === 0 ? "error" : "follow";
+  	}
+
+  
+  
+  function _JS_WebRequest_SetRequestHeader(requestId, header, value)
+  	{
+  		var requestOptions = wr.requests[requestId];
+  		if (!requestOptions) {
+              return;
+  		}
+  
+  		var _header = UTF8ToString(header);
+  		var _value = UTF8ToString(value);
+  		requestOptions.init.headers[_header] = _value;
+  	}
+
+  function _JS_WebRequest_SetTimeout(requestId, timeout)
+  	{
+          var requestOptions = wr.requests[requestId];
+  		if (!requestOptions) {
+              return;
+  		}
+  
+          requestOptions.timeout = timeout;
+  	}
+
   var ___assert_fail = (condition, filename, line, func) =>
       abort(`Assertion failed: ${UTF8ToString(condition)}, at: ` + [filename ? UTF8ToString(filename) : 'unknown filename', line, func ? UTF8ToString(func) : 'unknown function']);
 
@@ -10070,6 +10373,48 @@ async function createWasm() {
       return 0;
     ;
   }
+
+  var readEmAsmArgsArray = [];
+  var readEmAsmArgs = (sigPtr, buf) => {
+      // Nobody should have mutated _readEmAsmArgsArray underneath us to be something else than an array.
+      assert(Array.isArray(readEmAsmArgsArray));
+      // The input buffer is allocated on the stack, so it must be stack-aligned.
+      assert(buf % 16 == 0);
+      readEmAsmArgsArray.length = 0;
+      var ch;
+      // Most arguments are i32s, so shift the buffer pointer so it is a plain
+      // index into HEAP32.
+      while (ch = HEAPU8[sigPtr++]) {
+        var chr = String.fromCharCode(ch);
+        var validChars = ['d', 'f', 'i', 'p'];
+        // In WASM_BIGINT mode we support passing i64 values as bigint.
+        validChars.push('j');
+        assert(validChars.includes(chr), `Invalid character ${ch}("${chr}") in readEmAsmArgs! Use only [${validChars}], and do not specify "v" for void return argument.`);
+        // Floats are always passed as doubles, so all types except for 'i'
+        // are 8 bytes and require alignment.
+        var wide = (ch != 105);
+        wide &= (ch != 112);
+        buf += wide && (buf % 8) ? 4 : 0;
+        readEmAsmArgsArray.push(
+          // Special case for pointers under wasm64 or CAN_ADDRESS_2GB mode.
+          ch == 112 ? HEAPU32[((buf)>>2)] :
+          ch == 106 ? HEAP64[((buf)>>3)] :
+          ch == 105 ?
+            HEAP32[((buf)>>2)] :
+            HEAPF64[((buf)>>3)]
+        );
+        buf += wide ? 8 : 4;
+      }
+      return readEmAsmArgsArray;
+    };
+  var runEmAsmFunction = (code, sigPtr, argbuf) => {
+      var args = readEmAsmArgs(sigPtr, argbuf);
+      assert(ASM_CONSTS.hasOwnProperty(code), `No EM_ASM constant found at address ${code}.  The loaded WebAssembly file is likely out of sync with the generated JavaScript.`);
+      return ASM_CONSTS[code](...args);
+    };
+  var _emscripten_asm_const_int = (code, sigPtr, argbuf) => {
+      return runEmAsmFunction(code, sigPtr, argbuf);
+    };
 
   var _emscripten_cancel_main_loop = () => {
       MainLoop.pause();
@@ -16145,7 +16490,7 @@ if (Module['wasmBinary']) wasmBinary = Module['wasmBinary'];
   'setTempRet0',
   'createNamedFunction',
   'withStackSave',
-  'readEmAsmArgs',
+  'runMainThreadEmAsm',
   'autoResumeAudioContext',
   'getDynCaller',
   'dynCall',
@@ -16242,7 +16587,6 @@ if (Module['wasmBinary']) wasmBinary = Module['wasmBinary'];
   'webgpu_LoadCache',
   'getStringHash',
   'storeWebGPUObjectCache',
-  'jsWebRequestGetResponseHeaderString',
 ];
 missingLibrarySymbols.forEach(missingLibrarySymbol)
 
@@ -16293,6 +16637,8 @@ missingLibrarySymbols.forEach(missingLibrarySymbol)
   'timers',
   'warnOnce',
   'readEmAsmArgsArray',
+  'readEmAsmArgs',
+  'runEmAsmFunction',
   'jstoi_q',
   'getExecutableName',
   'handleException',
@@ -16688,6 +17034,7 @@ missingLibrarySymbols.forEach(missingLibrarySymbol)
   'webgpu_cache',
   'webgpu_buildID',
   'wr',
+  'jsWebRequestGetResponseHeaderString',
   'IDBFS',
 ];
 unexportedSymbols.forEach(unexportedRuntimeSymbol);
@@ -16704,8 +17051,37 @@ unexportedSymbols.forEach(unexportedRuntimeSymbol);
 function checkIncomingModuleAPI() {
   ignoredModuleProp('fetchSettings');
 }
+var ASM_CONSTS = {
+  5383472: () => { return Module.window ? 1 : 0; },  
+ 5383506: () => { var win = Module.window ? Module.window : window; var AudioContext = win.AudioContext || win.webkitAudioContext; var infocontext = new AudioContext(); if (!infocontext) { return 0; } var inforate = infocontext.sampleRate; infocontext.close(); return inforate; },  
+ 5383770: () => { Module.mInputRegistered = false; },  
+ 5383807: () => { var win = Module.window ? Module.window : window; var AudioContext = win.AudioContext || win.webkitAudioContext; Module.context = new AudioContext(); if (!Module.context) { return 0; } Module.FMOD_JS_MixFunction = Module["cwrap"]('FMOD_JS_MixFunction', 'void', ['number']); return Module.context.sampleRate; },  
+ 5384119: ($0, $1) => { Module._as_script_node = Module.context.createScriptProcessor($1, 0, $0); Module["OutputWebAudio_resumeAudio"] = function() { if (Module.context && Module.mInputRegistered) { console.log('Resetting audio driver based on user input.'); Module._as_script_node.connect(Module.context.destination); Module._as_script_node.onaudioprocess = function(audioProcessingEvent) { Module._as_output_buffer = audioProcessingEvent.outputBuffer; Module.FMOD_JS_MixFunction(Module._as_output_buffer.getChannelData(0).length); }; Module.context.resume(); var win = Module.window ? Module.window : window; win.removeEventListener('click', Module.OutputWebAudio_resumeAudio, false); win.removeEventListener('touchend', Module.OutputWebAudio_resumeAudio, false); Module.mInputRegistered = false; } }; },  
+ 5384903: () => { if (Module.mInputRegistered) { Module.mInputRegistered = false; var win = Module.window ? Module.window : window; win.removeEventListener('click', Module["OutputWebAudio_resumeAudio"], false); win.removeEventListener('touchend', Module["OutputWebAudio_resumeAudio"], false); } },  
+ 5385184: () => { var win = Module.window ? Module.window : window; win.addEventListener('touchend', Module["OutputWebAudio_resumeAudio"], false); win.addEventListener('click', Module["OutputWebAudio_resumeAudio"], false); Module.mInputRegistered = true; },  
+ 5385425: () => { Module._as_script_node.disconnect(Module.context.destination); },  
+ 5385492: ($0, $1, $2, $3) => { var data = HEAPF32.subarray(($0 / 4), ($0 / 4) + ($2 * $3)); for (var channel = 0; channel < $3; channel++) { var outputData = Module._as_output_buffer.getChannelData(channel); for (var sample = 0; sample < $2; sample++) { outputData[sample+$1] = data[(sample*$3)+channel]; } } },  
+ 5385774: () => { Module.context.suspend(); },  
+ 5385804: () => { Module.context.resume(); },  
+ 5385833: () => { var win = Module.window ? Module.window : window; var AudioContext = win.AudioContext || win.webkitAudioContext; var infocontext = new AudioContext(); if (!infocontext) { return 0; } var inforate = infocontext.sampleRate; infocontext.close(); return inforate; },  
+ 5386097: () => { Module.mWorkletNode = null; Module.mModulePolling = false; Module.mModuleLoading = false; Module.mStartInterval = null; Module.mStopInterval = null; Module.mSuspendInterval = null; Module.mResumeInterval = null; Module.mWorkletNodeConnected = false; Module.mInputRegistered = false; var win = Module.window ? Module.window : window; var AudioContext = win.AudioContext || win.webkitAudioContext; Module.mContext = new AudioContext(); if (!Module.mContext) { return 0; } Module.mContext.destination.channelCount = Module.mContext.destination.maxChannelCount; return Module.mContext.destination.maxChannelCount; },  
+ 5386711: ($0) => { const initAddModuleRef = $0; if (!initAddModuleRef) { Module.mAddModuleRef = 0; } if (!self.AudioWorkletNode) { return -1; } if (!Module.mContext.audioWorklet.addModule) { return -2; } Module.FMOD_JS_MixerSlowpathFunction = Module["cwrap"]('FMOD_JS_MixerSlowpathFunction', 'void', []); Module.FMOD_JS_MixerFastpathFunction = Module["cwrap"]('FMOD_JS_MixerFastpathFunction', 'void', ['number']); return Module.mContext.sampleRate; },  
+ 5387145: ($0, $1) => { Module.mSpeakerChannelCount = $0; const bufferLength = $1; Module.mUrl = null; Module.mOutputData = null; Module.mSharedArrayBuffers = false; if (self.SharedArrayBuffer) { if (self.crossOriginIsolated) { Module.mSharedArrayBuffers = true; } } if (!Module.mSharedArrayBuffers) { const slowCodePath = new Blob( [ "class AudioProcessor extends AudioWorkletProcessor", "{", "constructor(options)", "{", "super();", "this.payload = [null, null];", "this.bufferFlag = 0;", "this.dataFlag = 0;", "this.bufferIndex = 0;", "this.bufferSize = 0;", "this.channelCount = options.outputChannelCount;", "this.port.onmessage = (event) => {", "const { data } = event;", "if (data)", "{", "this.payload[this.dataFlag] = new Float32Array(data);", "this.bufferSize = data.length / this.channelCount;", "}", "else", "{", "this.payload[this.dataFlag] = null;", "}", "this.dataFlag ^= 1;", "};", "}", "process(inputs, outputs, parameters)", "{", "const output = outputs[0];", "if (output.length === 0) return true;", "if (this.payload[this.bufferFlag]) {", "if (this.bufferIndex === 0) {", "this.port.postMessage(this.bufferSize);", "}", "const bufferSliceEnd = this.bufferSize / output[0].length;", "const sliceOffset = output[0].length * this.bufferIndex;", "for (let channel = 0; channel < output.length; ++channel) {", "const outputChannel = output[channel];", "const indexOffset = this.bufferSize * channel + sliceOffset;", "outputChannel.set(new Float32Array(this.payload[this.bufferFlag].slice(0 + indexOffset, outputChannel.length + indexOffset)));", "}", "this.bufferIndex++;", "if (this.bufferIndex === bufferSliceEnd) {", "this.bufferIndex = 0;", "this.bufferFlag ^= 1;", "}", "}", "return true;", "}", "}", "registerProcessor('audio-processor', AudioProcessor);" ], { type: 'application/javascript' }); Module.mUrl = URL.createObjectURL(slowCodePath); Module.mOutputData = new Float32Array(Module.mSpeakerChannelCount * bufferLength); } else { const fastCodePath = new Blob( [ "class AudioProcessor extends AudioWorkletProcessor", "{", "constructor(options)", "{", "super();", "this.payload = null;", "this.bufferFlag = 0;", "this.bufferIndex = 0;", "this.bufferSize = 0;", "this.bufferOffset = 0;", "this.channelCount = options.outputChannelCount;", "this.port.onmessage = (event) => {", "const { data } = event;", "if (data)", "{", "this.payload = data;", "this.bufferSize = this.payload.length / (this.channelCount * 2);", "this.bufferOffset = this.payload.length / 2;", "}", "else", "{", "this.payload = null;", "}", "};", "}", "process(inputs, outputs, parameters)", "{", "const output = outputs[0];", "if (output.length === 0) return true;", "if (this.payload) {", "if (this.bufferIndex === 0) {", "this.port.postMessage(this.bufferFlag ^ 1);", "}", "const bufferSliceEnd = this.bufferSize / output[0].length;", "const sliceOffset = output[0].length * this.bufferIndex + this.bufferOffset * this.bufferFlag;", "for (let channel = 0; channel < output.length; ++channel) {", "const outputChannel = output[channel];", "const indexOffset = this.bufferSize * channel + sliceOffset;", "outputChannel.set(new Float32Array(this.payload.slice(0 + indexOffset, outputChannel.length + indexOffset)));", "}", "this.bufferIndex++;", "if (this.bufferIndex === bufferSliceEnd) {", "this.bufferIndex = 0;", "this.bufferFlag ^= 1;", "}", "}", "return true;", "}", "}", "registerProcessor('audio-processor', AudioProcessor);" ], { type: 'application/javascript' }); Module.mUrl = URL.createObjectURL(fastCodePath); Module.mOutputData = new Float32Array(new SharedArrayBuffer(Float32Array.BYTES_PER_ELEMENT * Module.mSpeakerChannelCount * bufferLength * 2)); } Module.mModulePolling = true; Module["waitForAudioWorklet"] = function(condition, callback) { var myInterval = null; if (condition()) { myInterval = setInterval(function() { if (!condition()) { callback(); clearInterval(myInterval); } }, 50); } else { callback(); return null; } return myInterval; }; Module["OutputAudioWorklet_resumeAudio"] = function() { if (Module.mContext && Module.mInputRegistered) { console.log('Resetting audio driver based on user input.'); Module.mContext.resume(); var win = Module.window ? Module.window : window; win.removeEventListener('click', Module.OutputAudioWorklet_resumeAudio, false); win.removeEventListener('touchend', Module.OutputAudioWorklet_resumeAudio, false); Module.mInputRegistered = false; if (!Module.mModuleLoading) { Module.mModuleLoading = true; Module.mAddModuleRef++; Module.mContext.resume().then(function() { Module.mContext.audioWorklet.addModule(Module.mUrl).then(function() { if (Module.mAddModuleRef === 1) { Module.mWorkletNode = new AudioWorkletNode(Module.mContext, 'audio-processor', { 'outputChannelCount' : [Module.mSpeakerChannelCount] }); Module.mModulePolling = false; URL.revokeObjectURL(Module.mUrl); if (Module.mWorkletNode) { Module.mWorkletNode.port.postMessage(Module.mOutputData); if (Module.mSharedArrayBuffers) { Module.mWorkletNode.port.onmessage = function(event) { Module.FMOD_JS_MixerFastpathFunction(event.data); }; } else { Module.mWorkletNode.port.onmessage = function(event) { Module.FMOD_JS_MixerSlowpathFunction(); Module.mWorkletNode.port.postMessage(Module.mOutputData); }; } } else { console.log('Error when creating AudioWorkletNode: Null object'); } } Module.mAddModuleRef--; }).catch (function(err) { Module.mModulePolling = false; Module.mAddModuleRef--; console.log('Error when opening audio processor '); console.log(err) }); }).catch (function(err) { Module.mModulePolling = false; Module.mAddModuleRef--; console.log('Error with mContext.resume()'); console.log(err) }); } } }; return Module.mSharedArrayBuffers; },  
+ 5392800: () => { var win = Module.window ? Module.window : window; win.addEventListener('touchend', Module["OutputAudioWorklet_resumeAudio"], false); win.addEventListener('click', Module["OutputAudioWorklet_resumeAudio"], false); Module.mInputRegistered = true; },  
+ 5393049: () => { if (Module.mStartInterval) { clearInterval(Module.mStartInterval); } if (Module.mStopInterval) { clearInterval(Module.mStopInterval); } if (Module.mSuspendInterval) { clearInterval(Module.mSuspendInterval); } if (Module.mResumeInterval) { clearInterval(Module.mResumeInterval); } if (Module.mWorkletNode) { if (Module.mWorkletNodeConnected) { Module.mWorkletNode.disconnect(); } } if (Module.mContext) { Module.mContext.close(); } if (Module.mInputRegistered) { Module.mInputRegistered = false; var win = Module.window ? Module.window : window; win.removeEventListener('click', Module["OutputAudioWorklet_resumeAudio"], false); win.removeEventListener('touchend', Module["OutputAudioWorklet_resumeAudio"], false); } },  
+ 5393769: () => { Module.mStartInterval = Module["waitForAudioWorklet"](function(){ return (Module.mWorkletNode === null && Module.mModulePolling); }, function(){ if (Module.mWorkletNode) { Module.mWorkletNode.connect(Module.mContext.destination); Module.mWorkletNodeConnected = true; } }); },  
+ 5394046: () => { if (Module["waitForAudioWorklet"]) { Module.mStopInterval = Module["waitForAudioWorklet"](function(){ return (Module.mWorkletNode === null && Module.mModulePolling || !Module.mWorkletNodeConnected); }, function(){ if (Module.mWorkletNode) { Module.mWorkletNode.disconnect(); Module.mWorkletNodeConnected = false; } }); } },  
+ 5394371: ($0, $1, $2) => { const buffer = $0; const bufferLength = $1; const speakerModeChannels = $2; var data = HEAPF32.subarray((buffer / 4), (buffer / 4) + (bufferLength * speakerModeChannels)); for (var channel = 0; channel < speakerModeChannels; channel++) { const offset = channel * bufferLength; for (var sample = 0; sample < bufferLength; sample++) { Module.mOutputData[sample + offset] = data[(sample * speakerModeChannels) + channel]; } } },  
+ 5394798: ($0, $1, $2, $3) => { const buffer = $0; const bufferLength = $1; const speakerModeChannels = $2; const frameFlag = $3; var data = HEAPF32.subarray((buffer / 4), (buffer / 4) + (bufferLength * speakerModeChannels)); const arrayOffset = speakerModeChannels * frameFlag * bufferLength; for (var channel = 0; channel < speakerModeChannels; channel++) { const offset = channel * bufferLength + arrayOffset; for (var sample = 0; sample < bufferLength; sample++) { Module.mOutputData[sample + offset] = data[(sample * speakerModeChannels) + channel]; } } },  
+ 5395329: () => { if (Module.mContext) { Module.mContext.suspend(); } },  
+ 5395385: () => { if (Module.mContext) { Module.mContext.resume(); } },  
+ 5395440: () => { var win = Module.window ? Module.window : window; var AudioContext = win.AudioContext || win.webkitAudioContext; var contextForCheck = new AudioContext(); if (!contextForCheck) { return 0; } var retValue = 0; if (self.AudioWorkletNode) { if (contextForCheck.audioWorklet.addModule) { retValue = 1; } } contextForCheck.close(); return retValue; }
+};
 
 // Imports from the Wasm binary.
+var _FMOD_JS_MixFunction = Module['_FMOD_JS_MixFunction'] = makeInvalidEarlyAccess('_FMOD_JS_MixFunction');
+var _FMOD_JS_MixerSlowpathFunction = Module['_FMOD_JS_MixerSlowpathFunction'] = makeInvalidEarlyAccess('_FMOD_JS_MixerSlowpathFunction');
+var _FMOD_JS_MixerFastpathFunction = Module['_FMOD_JS_MixerFastpathFunction'] = makeInvalidEarlyAccess('_FMOD_JS_MixerFastpathFunction');
 var _GetFakemodTimeInSeconds = Module['_GetFakemodTimeInSeconds'] = makeInvalidEarlyAccess('_GetFakemodTimeInSeconds');
 var _ReleaseKeys = Module['_ReleaseKeys'] = makeInvalidEarlyAccess('_ReleaseKeys');
 var _GetCopyBufferAsCStr = Module['_GetCopyBufferAsCStr'] = makeInvalidEarlyAccess('_GetCopyBufferAsCStr');
@@ -16746,6 +17122,12 @@ var wasmMemory = makeInvalidEarlyAccess('wasmMemory');
 var wasmTable = makeInvalidEarlyAccess('wasmTable');
 
 function assignWasmExports(wasmExports) {
+  assert(typeof wasmExports['FMOD_JS_MixFunction'] != 'undefined', 'missing Wasm export: FMOD_JS_MixFunction');
+  _FMOD_JS_MixFunction = Module['_FMOD_JS_MixFunction'] = createExportWrapper('FMOD_JS_MixFunction', 1);
+  assert(typeof wasmExports['FMOD_JS_MixerSlowpathFunction'] != 'undefined', 'missing Wasm export: FMOD_JS_MixerSlowpathFunction');
+  _FMOD_JS_MixerSlowpathFunction = Module['_FMOD_JS_MixerSlowpathFunction'] = createExportWrapper('FMOD_JS_MixerSlowpathFunction', 0);
+  assert(typeof wasmExports['FMOD_JS_MixerFastpathFunction'] != 'undefined', 'missing Wasm export: FMOD_JS_MixerFastpathFunction');
+  _FMOD_JS_MixerFastpathFunction = Module['_FMOD_JS_MixerFastpathFunction'] = createExportWrapper('FMOD_JS_MixerFastpathFunction', 1);
   assert(typeof wasmExports['GetFakemodTimeInSeconds'] != 'undefined', 'missing Wasm export: GetFakemodTimeInSeconds');
   _GetFakemodTimeInSeconds = Module['_GetFakemodTimeInSeconds'] = createExportWrapper('GetFakemodTimeInSeconds', 0);
   assert(typeof wasmExports['ReleaseKeys'] != 'undefined', 'missing Wasm export: ReleaseKeys');
@@ -17018,6 +17400,24 @@ var wasmImports = {
   /** @export */
   JS_WebPlayer_FinishInitialization: _JS_WebPlayer_FinishInitialization,
   /** @export */
+  JS_WebRequest_Abort: _JS_WebRequest_Abort,
+  /** @export */
+  JS_WebRequest_Create: _JS_WebRequest_Create,
+  /** @export */
+  JS_WebRequest_GetResponseMetaData: _JS_WebRequest_GetResponseMetaData,
+  /** @export */
+  JS_WebRequest_GetResponseMetaDataLengths: _JS_WebRequest_GetResponseMetaDataLengths,
+  /** @export */
+  JS_WebRequest_Release: _JS_WebRequest_Release,
+  /** @export */
+  JS_WebRequest_Send: _JS_WebRequest_Send,
+  /** @export */
+  JS_WebRequest_SetRedirectLimit: _JS_WebRequest_SetRedirectLimit,
+  /** @export */
+  JS_WebRequest_SetRequestHeader: _JS_WebRequest_SetRequestHeader,
+  /** @export */
+  JS_WebRequest_SetTimeout: _JS_WebRequest_SetTimeout,
+  /** @export */
   __assert_fail: ___assert_fail,
   /** @export */
   __syscall__newselect: ___syscall__newselect,
@@ -17093,6 +17493,8 @@ var wasmImports = {
   clock_res_get: _clock_res_get,
   /** @export */
   clock_time_get: _clock_time_get,
+  /** @export */
+  emscripten_asm_const_int: _emscripten_asm_const_int,
   /** @export */
   emscripten_cancel_main_loop: _emscripten_cancel_main_loop,
   /** @export */
